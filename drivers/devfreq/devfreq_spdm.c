@@ -370,7 +370,6 @@ static int probe(struct platform_device *pdev)
 		spdm_ipc_log_ctxt = NULL;
 	}
 
-
 	return 0;
 
 no_spdm_device:
