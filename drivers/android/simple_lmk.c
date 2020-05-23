@@ -28,21 +28,21 @@ struct victim_info {
 };
 
 /* Pulled from the Android framework. Lower adj means higher priority. */
-static const unsigned short adjs[] = {
-	SHRT_MAX + 1, /* Include all positive adjs in the final range */
-	950, /* CACHED_APP_LMK_FIRST_ADJ */
-	900, /* CACHED_APP_MIN_ADJ */
-	800, /* SERVICE_B_ADJ */
-	700, /* PREVIOUS_APP_ADJ */
-	600, /* HOME_APP_ADJ */
-	500, /* SERVICE_ADJ */
-	400, /* HEAVY_WEIGHT_APP_ADJ */
-	300, /* BACKUP_APP_ADJ */
-	250, /* PERCEPTIBLE_LOW_APP_ADJ */
-	200, /* PERCEPTIBLE_APP_ADJ */
-	100, /* VISIBLE_APP_ADJ */
-	50, /* PERCEPTIBLE_RECENT_FOREGROUND_APP_ADJ */
-	0 /* FOREGROUND_APP_ADJ */
+static const short adjs[] = {
+	1000, /* CACHED_APP_MAX_ADJ + 1 */
+	950,  /* CACHED_APP_LMK_FIRST_ADJ */
+	900,  /* CACHED_APP_MIN_ADJ */
+	800,  /* SERVICE_B_ADJ */
+	700,  /* PREVIOUS_APP_ADJ */
+	600,  /* HOME_APP_ADJ */
+	500,  /* SERVICE_ADJ */
+	400,  /* HEAVY_WEIGHT_APP_ADJ */
+	300,  /* BACKUP_APP_ADJ */
+	250,  /* PERCEPTIBLE_LOW_APP_ADJ */
+	200,  /* PERCEPTIBLE_APP_ADJ */
+	100,  /* VISIBLE_APP_ADJ */
+	50,   /* PERCEPTIBLE_RECENT_FOREGROUND_APP_ADJ */
+	0     /* FOREGROUND_APP_ADJ */
 };
 
 static struct victim_info victims[MAX_VICTIMS];
@@ -84,8 +84,8 @@ static unsigned long get_total_mm_pages(struct mm_struct *mm)
 	return pages;
 }
 
-static unsigned long find_victims(int *vindex, unsigned short target_adj_min,
-				  unsigned short target_adj_max)
+static unsigned long find_victims(int *vindex, short target_adj_min,
+				  short target_adj_max)
 {
 	unsigned long pages_found = 0;
 	int old_vindex = *vindex;
@@ -157,10 +157,11 @@ static int process_victims(int vlen, unsigned long pages_needed)
 		/* The victim's mm lock is taken in find_victims; release it */
 		if (pages_found >= pages_needed) {
 			task_unlock(vtsk);
-		} else {
-			pages_found += victim->size;
-			nr_to_kill++;
+			continue;
 		}
+
+		pages_found += victim->size;
+		nr_to_kill++;
 	}
 
 	return nr_to_kill;
@@ -171,14 +172,18 @@ static void scan_and_kill(unsigned long pages_needed)
 	int i, nr_to_kill = 0, nr_victims = 0, ret;
 	unsigned long pages_found = 0;
 
-	/* Hold an RCU read lock while traversing the global process list */
-	rcu_read_lock();
+	/*
+	 * Hold the tasklist lock so tasks don't disappear while scanning. This
+	 * is preferred to holding an RCU read lock so that the list of tasks
+	 * is guaranteed to be up to date.
+	 */
+	read_lock(&tasklist_lock);
 	for (i = 1; i < ARRAY_SIZE(adjs); i++) {
 		pages_found += find_victims(&nr_victims, adjs[i], adjs[i - 1]);
 		if (pages_found >= pages_needed || nr_victims == MAX_VICTIMS)
 			break;
 	}
-	rcu_read_unlock();
+	read_unlock(&tasklist_lock);
 
 	/* Pretty unlikely but it can happen */
 	if (unlikely(!nr_victims)) {
@@ -208,7 +213,7 @@ static void scan_and_kill(unsigned long pages_needed)
 	for (i = 0; i < nr_to_kill; i++) {
 		static const struct sched_param sched_zero_prio;
 		struct victim_info *victim = &victims[i];
-		struct task_struct *t, *vtsk = victim->tsk;
+		struct task_struct *vtsk = victim->tsk;
 
 		pr_info("Killing %s with adj %d to free %lu KiB\n", vtsk->comm,
 			vtsk->signal->oom_score_adj,
@@ -216,12 +221,6 @@ static void scan_and_kill(unsigned long pages_needed)
 
 		/* Accelerate the victim's death by forcing the kill signal */
 		do_send_sig_info(SIGKILL, SEND_SIG_FORCED, vtsk, true);
-
-		/* Mark the thread group dead so that other kernel code knows */
-		rcu_read_lock();
-		for_each_thread(vtsk, t)
-			set_tsk_thread_flag(t, TIF_MEMDIE);
-		rcu_read_unlock();
 
 		/* Elevate the victim to SCHED_RR with zero RT priority */
 		sched_setscheduler_nocheck(vtsk, SCHED_RR, &sched_zero_prio);
@@ -256,7 +255,7 @@ static int simple_lmk_reclaim_thread(void *data)
 	sched_setscheduler_nocheck(current, SCHED_FIFO, &sched_max_rt_prio);
 
 	while (1) {
-		wait_event(oom_waitq, atomic_read(&needs_reclaim));
+		wait_event(oom_waitq, atomic_read_acquire(&needs_reclaim));
 		scan_and_kill(MIN_FREE_PAGES);
 		atomic_set_release(&needs_reclaim, 0);
 	}
@@ -270,13 +269,11 @@ void simple_lmk_mm_freed(struct mm_struct *mm)
 
 	read_lock(&mm_free_lock);
 	for (i = 0; i < victims_to_kill; i++) {
-		if (victims[i].mm != mm)
-			continue;
-
-		victims[i].mm = NULL;
-		if (atomic_inc_return_relaxed(&nr_killed) == victims_to_kill)
-			complete(&reclaim_done);
-		break;
+		if (cmpxchg(&victims[i].mm, mm, NULL) == mm) {
+			if (atomic_inc_return(&nr_killed) == victims_to_kill)
+				complete(&reclaim_done);
+			break;
+		}
 	}
 	read_unlock(&mm_free_lock);
 }
